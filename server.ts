@@ -31,12 +31,25 @@ async function startServer() {
   // Allow base64 screenshot uploads up to 8MB in memory only (never saved to disk)
   app.use(express.json({ limit: '8mb' }));
 
+  // Serve local Tesseract.js worker, WASM core, and English language data from node_modules
+  // so client-side fallback OCR loads reliably from same-origin without external CDNs
+  app.use(
+    '/ocr/worker.min.js',
+    express.static(path.join(__dirname, 'node_modules/tesseract.js/dist/worker.min.js'))
+  );
+  app.use('/ocr/core', express.static(path.join(__dirname, 'node_modules/tesseract.js-core')));
+  app.use(
+    '/ocr/lang',
+    express.static(path.join(__dirname, 'node_modules/@tesseract.js-data/eng/4.0.0_best_int'))
+  );
+
   // Health & capability status endpoint
   app.get('/api/status', (_req, res) => {
     const aiConfigured = Boolean(getGenAIClient());
     res.json({
       aiConfigured,
       liveReputationConfigured: false,
+      localOcrAvailable: true,
       storagePolicy: 'in-memory-transient-only',
     });
   });

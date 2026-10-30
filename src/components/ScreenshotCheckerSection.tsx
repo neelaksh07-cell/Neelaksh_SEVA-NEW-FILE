@@ -8,9 +8,29 @@ import {
   Trash2,
   AlertCircle,
 } from 'lucide-react';
+import { createWorker } from 'tesseract.js';
 import { analyzeScamContent, ScamAnalysisResult } from '../utils/scamAnalyzer';
 import { SAMPLE_SCREENSHOT_SCENARIOS, SampleScreenshotScenario } from '../data/learningContent';
 import { RiskResultPanel } from './RiskResultPanel';
+
+/**
+ * Runs local browser-based OCR using Tesseract.js with locally served worker,
+ * WASM core, and English traineddata assets so uploaded screenshots work even
+ * when server-side GEMINI_API_KEY is not configured.
+ */
+async function runLocalBrowserOcr(dataUrl: string): Promise<string> {
+  const worker = await createWorker('eng', 1, {
+    workerPath: '/ocr/worker.min.js',
+    corePath: '/ocr/core',
+    langPath: '/ocr/lang',
+  });
+  try {
+    const { data } = await worker.recognize(dataUrl);
+    return (data?.text || '').trim();
+  } finally {
+    await worker.terminate();
+  }
+}
 
 /**
  * Generates a realistic educational SMS/Email screenshot PNG data URL on an HTML5 canvas
@@ -88,6 +108,9 @@ export const ScreenshotCheckerSection: React.FC = () => {
     if (fallbackTextForSample) {
       setExtractedText(fallbackTextForSample);
       setAnalysisResult(analyzeScamContent(fallbackTextForSample));
+    } else {
+      setExtractedText('');
+      setAnalysisResult(null);
     }
 
     try {
@@ -102,20 +125,49 @@ export const ScreenshotCheckerSection: React.FC = () => {
       });
 
       const data = await response.json();
-      const textFound = (data?.extractedText || fallbackTextForSample || '').trim();
+      const serverAvailable = Boolean(data?.available);
+      let textFound = typeof data?.extractedText === 'string' ? data.extractedText.trim() : '';
+      let statusNote = typeof data?.note === 'string' ? data.note : '';
+
+      // When server-side Gemini Vision OCR reports available: false or returns empty extractedText,
+      // run local browser OCR for uploaded screenshots (or fall back to built-in sample text).
+      if (!serverAvailable || !textFound) {
+        if (!textFound && !fallbackTextForSample) {
+          setOcrStatusNote(
+            'Server-side Gemini Vision OCR is unavailable; running local browser OCR (Tesseract.js) on your uploaded screenshot...'
+          );
+          try {
+            const localOcrText = await runLocalBrowserOcr(dataUrl);
+            if (localOcrText) {
+              textFound = localOcrText;
+              statusNote =
+                'Server-side Gemini Vision OCR is currently unavailable (API key not configured). Visible text was extracted locally in your browser using Tesseract.js OCR for heuristic scam analysis.';
+            } else {
+              statusNote =
+                'Local browser OCR completed but did not detect readable text in this image. You can type or edit the visible text manually below.';
+            }
+          } catch {
+            statusNote =
+              'Local browser OCR could not extract text from this image. You can still type or paste the visible text manually below to run heuristic checks.';
+          }
+        } else if (!textFound && fallbackTextForSample) {
+          textFound = fallbackTextForSample.trim();
+        }
+      }
+
       setExtractedText(textFound);
       setVisualObservations(data?.visualObservations || '');
       setUncertaintyNote(
         data?.uncertaintyNote ||
           'Static screenshots do not verify sender cryptographic signatures; contact names or headers can be spoofed or edited.'
       );
-      if (data?.note) {
-        setOcrStatusNote(data.note);
+      if (statusNote) {
+        setOcrStatusNote(statusNote);
       }
 
       if (textFound) {
         const heuristic = analyzeScamContent(textFound);
-        if (data?.available && data?.visualObservations) {
+        if (serverAvailable && data?.visualObservations) {
           heuristic.aiExplanation = {
             available: true,
             source: 'gemini-server',
@@ -124,13 +176,13 @@ export const ScreenshotCheckerSection: React.FC = () => {
               data.uncertaintyNote ||
               'Never call phone numbers or visit URLs transcribed from an unexpected screenshot without independent verification.',
           };
-        } else if (data?.note) {
+        } else if (statusNote) {
           heuristic.aiExplanation = {
             available: false,
             source: 'heuristic-only',
             plainLanguageBreakdown: '',
             keyTakeaway: '',
-            note: data.note,
+            note: statusNote,
           };
         }
         setAnalysisResult(heuristic);
@@ -145,9 +197,32 @@ export const ScreenshotCheckerSection: React.FC = () => {
         );
         setAnalysisResult(analyzeScamContent(fallbackTextForSample));
       } else {
-        setErrorMsg(
-          'Could not reach the server-side image OCR service. You can still type or paste the visible text below to run heuristic checks.'
-        );
+        try {
+          const localOcrText = await runLocalBrowserOcr(dataUrl);
+          if (localOcrText) {
+            const note =
+              'Server-side Vision OCR was unreachable; visible text was extracted locally in your browser using Tesseract.js OCR.';
+            setExtractedText(localOcrText);
+            setOcrStatusNote(note);
+            const heuristic = analyzeScamContent(localOcrText);
+            heuristic.aiExplanation = {
+              available: false,
+              source: 'heuristic-only',
+              plainLanguageBreakdown: '',
+              keyTakeaway: '',
+              note,
+            };
+            setAnalysisResult(heuristic);
+          } else {
+            setErrorMsg(
+              'No readable text was detected in the uploaded image. You can type or paste the visible text below to run heuristic checks.'
+            );
+          }
+        } catch {
+          setErrorMsg(
+            'Could not reach the server-side image OCR service. You can still type or paste the visible text below to run heuristic checks.'
+          );
+        }
       }
     } finally {
       setIsAnalysing(false);
